@@ -1005,7 +1005,7 @@ function raid_nvmf_uaf_test() {
 		echo "starting iteration $iteration of $max_iterations"
 
 		# Start SPDK target with NVMe-oF support
-		$rootdir/build/bin/spdk_tgt > /tmp/raid_nvmf_uaf_test.log 2>&1 &
+		$rootdir/build/bin/spdk_tgt &
 		local spdk_pid=$!
 		waitforlisten $spdk_pid
 
@@ -1055,10 +1055,10 @@ function raid_nvmf_uaf_test() {
 		# Connect to RAID1 device from host side
 		sleep 0.1
 		local dev_before dev_after new_nvme_dev
-		dev_before=$(ls /dev/nvme*n* 2> /dev/null)
+		dev_before=$(printf "%s\n" /dev/nvme*n*)
 		nvme connect -t tcp -n $raid_nqn -a $tcp_addr -s $raid_port --ctrl-loss-tmo=0
 		sleep 0.1
-		dev_after=$(ls /dev/nvme*n* 2> /dev/null)
+		dev_after=$(printf "%s\n" /dev/nvme*n*)
 		new_nvme_dev=$(comm -13 <(echo "$dev_before") <(echo "$dev_after"))
 
 		# Mount filesystem and start I/O workload
@@ -1095,20 +1095,19 @@ function raid_nvmf_uaf_test() {
 			sleep 0.1
 		done
 
-		# Wait for UAF race condition: fast_io_fail_timeout_sec (10s) expires,
+		# Wait for UAF race condition: fast_io_fail_timeout_sec (2s) expires,
 		# causing base bdev removal while NVMe module attempts I/O abort on
 		# already-freed core channel pointers
 		sleep 6
 
+    killprocess $fio_pid 2> /dev/null || true
+    umount -fl $new_nvme_dev 2> /dev/null || true
+    nvme disconnect -n $raid_nqn 2> /dev/null || true
+    rm -rf $raid_uaf_tmp_dir
 		if ! kill -0 $spdk_pid 2> /dev/null; then
 			echo "spdk_tgt crashed during iteration $iteration"
-			echo "see spdk_tgt logs at: /tmp/raid_nvmf_uaf_test.log"
 			return 1
 		else
-			killprocess $fio_pid 2> /dev/null || true
-			umount -fl $new_nvme_dev 2> /dev/null || true
-			nvme disconnect -n $raid_nqn 2> /dev/null || true
-			rm -rf "$raid_uaf_tmp_dir"
 			killprocess $spdk_pid 2> /dev/null || true
 		fi
 	done
