@@ -16,8 +16,11 @@ fi
 rootdir=$(readlink -f $(dirname $0))/..
 source "$rootdir/scripts/common.sh"
 
-# Path for persisted sysctl configuration (Linux only usage)
-SYSCTL_SPDK_CONF=/usr/local/lib/sysctl.d/99-spdk.conf
+# Path for persisted hugepage configuration (Linux only usage). The global and
+# per-node (HUGENODE) reservations are re-applied at boot via systemd-tmpfiles.
+# /etc/tmpfiles.d is used since /usr/local/lib/tmpfiles.d isn't in the default
+# search path on most distributions.
+TMPFILES_SPDK_CONF=/etc/tmpfiles.d/spdk-hugepages.conf
 
 function usage() {
 	if [[ $os == Linux ]]; then
@@ -104,9 +107,10 @@ function usage() {
 	echo "FORCE_NIC_UIO_REBIND"
 	echo "                  When set to 'yes', an attempt to reload nic_uio will be made regardless"
 	echo "                  of the kernel environment. Applicable only under FreeBSD."
-	echo "PERSIST_HUGE      When set to 'yes', persist number of hugepages to $SYSCTL_SPDK_CONF"
-	echo "                  as vm.nr_hugepages. NUMA per-node persistence is not supported, and this option is ignored"
-	echo "                  when HUGENODE is set."
+	echo "PERSIST_HUGE      When set to 'yes', persist the hugepage reservation, including the"
+	echo "                  per-node layout when HUGENODE is set, across reboots. The reservation"
+	echo "                  is written to $TMPFILES_SPDK_CONF and re-applied"
+	echo "                  at boot via systemd-tmpfiles. Requires systemd."
 	exit 0
 }
 
@@ -526,7 +530,38 @@ check_hugepages_alloc() {
 
 clear_hugepages() {
 	echo 0 > /proc/sys/vm/nr_hugepages
-	rm -f "$SYSCTL_SPDK_CONF"
+	rm -f "$TMPFILES_SPDK_CONF"
+}
+
+persist_hp() {
+	# Persist the hugepage reservation across reboots by re-applying the
+	# procfs|sysfs writes at boot via a systemd-tmpfiles drop-in. Takes a list
+	# of path-count pairs, each pair becoming a single "w" entry.
+	[[ $PERSIST_HUGE == yes ]] || return 0
+
+	if [[ ! -d /run/systemd/system ]]; then
+		echo "systemd is not the running init system, not persisting hugepages to $TMPFILES_SPDK_CONF" >&2
+		return 0
+	fi
+
+	local path count entries=()
+
+	while (($# > 1)); do
+		path=$1 count=$2
+		shift 2
+		((count > 0)) || continue
+		entries+=("w $path - - - - $count")
+	done
+
+	if ((${#entries[@]} == 0)); then
+		# Nothing to persist, make sure no stale reservation is re-applied on boot.
+		rm -f "$TMPFILES_SPDK_CONF"
+		return 0
+	fi
+
+	echo "Persisting hugepage reservation to $TMPFILES_SPDK_CONF"
+	mkdir -p "$(dirname "$TMPFILES_SPDK_CONF")"
+	printf '%s\n' "${entries[@]}" > "$TMPFILES_SPDK_CONF"
 }
 
 configure_linux_hugepages() {
@@ -559,16 +594,7 @@ configure_linux_hugepages() {
 
 	if [[ -z $HUGENODE ]]; then
 		check_hugepages_alloc /proc/sys/vm/nr_hugepages
-
-		# Optionally persist number of hugepages
-		[[ $PERSIST_HUGE == yes ]] || return 0
-		local current_nr
-
-		current_nr=$(< /proc/sys/vm/nr_hugepages)
-		((current_nr > 0)) || return 0
-		echo "Trying to persist vm.nr_hugepages=$current_nr to $SYSCTL_SPDK_CONF"
-		mkdir -p "$(dirname $SYSCTL_SPDK_CONF)"
-		echo "vm.nr_hugepages=$current_nr" > "$SYSCTL_SPDK_CONF"
+		persist_hp /proc/sys/vm/nr_hugepages "$(< /proc/sys/vm/nr_hugepages)"
 
 		return 0
 	fi
@@ -605,6 +631,13 @@ configure_linux_hugepages() {
 		fi
 		NRHUGE=${nodes_hp[node]:-$NRHUGE} check_hugepages_alloc "${nodes[node]}" "$node"
 	done
+
+	local hp_pairs=()
+	for node in "${!nodes_hp[@]}"; do
+		[[ -n ${nodes[node]} ]] || continue
+		hp_pairs+=("${nodes[node]}" "${nodes_hp[node]:-$NRHUGE}")
+	done
+	persist_hp "${hp_pairs[@]}"
 }
 
 function configure_linux() {
